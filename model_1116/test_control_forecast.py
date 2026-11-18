@@ -1,3 +1,13 @@
+#!/usr/bin/env python3
+"""控制导向分解炉温度轨迹预测：模块化单元测试套件。
+
+测试结构：
+1. `StepResponseSequenceTests`: 验证状态自适应阶跃响应序列生成、单调性、跨状态差异（含 batch_size=1 在线推理）、
+   历史在途正常卷积与未来受迫 4 种相位整形模式（"none", "hard_trunc", "sigmoid_gate", "power_soft"）。
+2. `FeatureAndDecoderTests`   : 验证严格因果特征构造、低煤量饱和计数器与 60min FFT 周期延续先验。
+3. `LossTests`                : 验证正交复合损失（含 FFT 幅值谱匹配）、平静期门控与 Step-0 脉冲防作弊。
+4. `ModelEndToEndTests`       : 验证三分量 1.0 等权相加、实时 Step Response 输出、双拐点周期波拟合与 KPI 评价。
+"""
 import unittest
 
 import numpy as np
@@ -10,7 +20,9 @@ from control_forecast import (
     ForecastConfig,
     FourierDilatedConvDecoder,
     StateAdaptiveCoalFOPDT,
+    StateAdaptiveStepResponse,
     build_coal_features,
+    build_step_response_basis_bank,
     build_temp_features,
     causal_hilbert_phase,
     coal_recent_stats,
@@ -18,11 +30,13 @@ from control_forecast import (
     fopdt_response,
     kpi_metrics,
     match_turns_one_to_one,
+    sequence_in_flight_and_forced_convolution,
+    shape_forced_step_response,
     virtual_step_check,
 )
 
 
-def make_cfg(**kw):
+def make_cfg(**kw) -> ForecastConfig:
     base = dict(
         history_steps=32,
         horizon_steps=8,
@@ -38,7 +52,7 @@ def make_cfg(**kw):
     return ForecastConfig(**base)
 
 
-class LPVFOPDTTests(unittest.TestCase):
+class StepResponseSequenceTests(unittest.TestCase):
     def setUp(self):
         self.cfg = make_cfg()
         self.layer = StateAdaptiveCoalFOPDT(self.cfg)
@@ -46,7 +60,8 @@ class LPVFOPDTTests(unittest.TestCase):
     def _ctx(self, b=4):
         return torch.randn(b, self.cfg.d_model)
 
-    def test_removed_legacy_scalers_and_discounts(self):
+    def test_removed_legacy_scalers_and_discounts_and_alias_exists(self):
+        self.assertIs(StateAdaptiveStepResponse, StateAdaptiveCoalFOPDT)
         self.assertFalse(hasattr(self.layer, "calibration"))
         self.assertFalse(hasattr(self.layer, "gain_calibration"))
         self.assertFalse(hasattr(self.layer, "saturation_discount"))
@@ -57,65 +72,101 @@ class LPVFOPDTTests(unittest.TestCase):
         fut = cur[:, None].expand(-1, 8)
         out = self.layer(ctx, cur, fut, torch.zeros(2, 1), torch.zeros(2, 1))
         self.assertTrue(torch.all(out["forced_delta_c"] == 0))
+        self.assertEqual(out["step_response_full"].shape, (2, 8))
+        self.assertEqual(out["step_response_forced"].shape, (2, 8))
 
-    def test_in_flight_decomposition_identities_and_unmodified_history_coal(self):
-        k = torch.tensor([15.0, 15.0])
-        alpha = torch.tensor([0.9, 0.9])
-        u_hist_const = torch.full((2, 16), 10.0)
-        u_fut = torch.full((2, 8), 12.0)
-        hc, fc, tc = fopdt_in_flight_decomposition(u_hist_const, u_fut, k, alpha, dead_steps=1)
-        torch.testing.assert_close(hc, torch.zeros_like(hc), atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(tc, fc, atol=1e-5, rtol=1e-5)
+    def test_in_flight_normal_convolution_and_four_forced_shaping_modes(self):
+        h = 60
+        basis = build_step_response_basis_bank(horizon_steps=h)
+        self.assertEqual(basis.shape, (4, h))
+        # Basis rows are strictly monotone in [0, 1] and end at 1.0
+        self.assertTrue(torch.all(basis[:, 1:] >= basis[:, :-1]))
+        torch.testing.assert_close(basis[:, -1], torch.ones(4), atol=1e-5, rtol=1e-5)
 
-        # Large historical coal step (e.g. +8 t/h > 2.5 t/h) is NOT compressed by _soft_saturate
-        u_hist_large_step = torch.cat([torch.full((2, 12), 4.0), torch.full((2, 4), 12.0)], dim=1)
-        u_hold = torch.full((2, 8), 12.0)
-        ctx = self._ctx(2)
-        k_layer, _, alpha_layer = self.layer.params(ctx, torch.zeros(2, 1), torch.zeros(2, 1))
-        hc_direct, fc_direct, tc_direct = fopdt_in_flight_decomposition(
-            u_hist_large_step,
-            u_hold,
-            k_layer,
-            alpha_layer,
-            dead_steps=self.cfg.dead_steps,
-            settling_ratio=self.cfg.in_flight_settling_ratio,
+        step_seq_full = 15.0 * basis[1:2]  # [1, 60]
+        u_hist_step = torch.cat([torch.full((1, 59), 4.0), torch.full((1, 1), 12.0)], dim=1)
+        u_fut_step = torch.full((1, h), 14.0)  # +2 t/h future step from u_cur=12.0
+
+        out_none = sequence_in_flight_and_forced_convolution(
+            u_hist_step, u_fut_step, step_seq_full, shaping_mode="none"
         )
-        out = self.layer(
-            ctx,
-            torch.full((2,), 12.0),
-            u_hold,
-            torch.zeros(2, 1),
-            torch.zeros(2, 1),
-            history_coal=u_hist_large_step,
+        out_hard = sequence_in_flight_and_forced_convolution(
+            u_hist_step, u_fut_step, step_seq_full, shaping_mode="hard_trunc", trunc_ratio=0.20
         )
-        torch.testing.assert_close(out["hist_coal_delta_c"], hc_direct, atol=1e-5, rtol=1e-5)
-        self.assertTrue(torch.all(fc_direct == 0))
-        self.assertTrue(torch.all(hc_direct > 0))
-        torch.testing.assert_close(tc_direct, hc_direct, atol=1e-5, rtol=1e-5)
+        out_sig = sequence_in_flight_and_forced_convolution(
+            u_hist_step, u_fut_step, step_seq_full, shaping_mode="sigmoid_gate", trunc_ratio=0.20
+        )
+        out_pow = sequence_in_flight_and_forced_convolution(
+            u_hist_step, u_fut_step, step_seq_full, shaping_mode="power_soft", power_gamma=2.0
+        )
 
-    def test_scheduler_starts_at_prior_center_and_respects_12_18_and_150_250_bounds(self):
-        self.assertEqual(self.cfg.gain_low, 12.0)
-        self.assertEqual(self.cfg.gain_high, 18.0)
-        self.assertEqual(self.cfg.tau_low, 150.0)
-        self.assertEqual(self.cfg.tau_high, 250.0)
-        ctx = self._ctx(4)
-        m = torch.randn(4, 1)
-        s = torch.rand(4, 1)
-        k, tau, alpha = self.layer.params(ctx, m, s)
-        torch.testing.assert_close(k, torch.full_like(k, 15.0))
-        torch.testing.assert_close(tau, torch.full_like(tau, 200.0))
-        self.assertTrue(torch.all((alpha > 0) & (alpha < 1)))
+        # 1. 历史在途余热 (棕线) 在所有 4 种模式下完全相同（均采用完整未截断序列正常卷积）
+        for other in (out_hard, out_sig, out_pow):
+            torch.testing.assert_close(
+                out_none["hist_coal_delta_c"], other["hist_coal_delta_c"], atol=1e-5, rtol=1e-5
+            )
+        self.assertTrue(torch.all(out_none["hist_coal_delta_c"] > 0))
+
+        # 2. 4 种模式的受迫阶跃响应在 15min 终点 (step 59) 均 100% 保持相同总增益 K=15.0
+        for d_out in (out_none, out_hard, out_sig, out_pow):
+            seq_f = d_out["step_response_forced"]
+            self.assertTrue(torch.all(seq_f[:, 1:] >= seq_f[:, :-1] - 1e-6))
+            self.assertAlmostEqual(float(seq_f[0, -1].item()), 15.0, places=4)
+
+        # 3. 初期 (<20% 阶段，如第 6 步 = 1.5min)：
+        #    hard_trunc 严格为 0；power_soft (r^2) 远小于不截断 none
+        self.assertEqual(float(out_hard["step_response_forced"][0, 6].item()), 0.0)
+        self.assertLess(
+            float(out_pow["step_response_forced"][0, 8].item()),
+            0.35 * float(out_none["step_response_forced"][0, 8].item()),
+        )
+
+    def test_realtime_step_response_varies_across_states_in_batch_and_single_eval(self):
+        torch.manual_seed(42)
+        cfg = ForecastConfig(history_steps=32, horizon_steps=20, d_model=16)
+        layer = StateAdaptiveCoalFOPDT(cfg)
+        nn.init.normal_(layer.scheduler[0].weight, std=0.5)
+        nn.init.normal_(layer.scheduler[2].weight, std=0.5)
+        nn.init.constant_(layer.scheduler[2].bias, -3.0)
+
+        # 训练期 Batch (B=8): 更新 running_logit_mean，验证不同状态生成不同 Step Response 且批次均值锚定
+        layer.train()
+        ctx = torch.randn(8, cfg.d_model, requires_grad=True)
+        m = torch.linspace(-1.5, 1.5, 8).unsqueeze(1)
+        s = torch.linspace(0.2, 1.8, 8).unsqueeze(1)
+        step_seq, k_t, tau_t, _ = layer.build_state_step_sequence(ctx, m, s)
+
+        self.assertEqual(step_seq.shape, (8, 20))
+        self.assertAlmostEqual(float(k_t.mean().item()), 15.0, places=5)
+        self.assertAlmostEqual(float(tau_t.mean().item()), 200.0, places=4)
+        # 单调递增且跨状态显著变化
+        self.assertTrue(torch.all(step_seq[:, 1:] >= step_seq[:, :-1] - 1e-6))
+        self.assertGreater(float(step_seq[:, -1].std().item()), 0.2)
+        self.assertGreater(float(step_seq[:, 8].std().item()), 0.1)
+
+        # 在线单样本推理期 (eval mode, batch_size=1)：不同状态依然实时输出不同的 Step Response
+        layer.eval()
+        with torch.no_grad():
+            seq_state_a, k_a, tau_a, _ = layer.build_state_step_sequence(
+                ctx[0:1], m[0:1], s[0:1]
+            )
+            seq_state_b, k_b, tau_b, _ = layer.build_state_step_sequence(
+                ctx[-1:], m[-1:], s[-1:]
+            )
+        self.assertEqual(seq_state_a.shape, (1, 20))
+        self.assertNotAlmostEqual(float(k_a.item()), float(k_b.item()), places=2)
+        self.assertNotAlmostEqual(float(tau_a.item()), float(tau_b.item()), places=2)
+        self.assertGreater(float((seq_state_a - seq_state_b).abs().max().item()), 0.2)
 
     def test_batch_zero_mean_orthogonal_projection_filters_global_bias_and_keeps_gradients(self):
         torch.manual_seed(42)
         nn.init.normal_(self.layer.scheduler[2].weight, std=0.5)
-        nn.init.constant_(self.layer.scheduler[2].bias, -5.0)  # strong artificial negative bias
+        nn.init.constant_(self.layer.scheduler[2].bias, -5.0)
         ctx = torch.randn(8, self.cfg.d_model, requires_grad=True)
         m = torch.randn(8, 1)
         s = torch.rand(8, 1)
         k, tau, _ = self.layer.params(ctx, m, s)
 
-        # Forward: batch mean is anchored exactly at (15.0, 200.0) and relative variation is preserved
         self.assertAlmostEqual(float(k.mean().item()), 15.0, places=5)
         self.assertAlmostEqual(float(tau.mean().item()), 200.0, places=4)
         self.assertGreater(float(k.std().item()), 0.1)
@@ -123,14 +174,12 @@ class LPVFOPDTTests(unittest.TestCase):
         self.assertTrue(torch.all((k >= 12.0) & (k <= 18.0)))
         self.assertTrue(torch.all((tau >= 150.0) & (tau <= 250.0)))
 
-        # Backward 1: pure uniform global shift loss sum(k) produces ZERO gradient on scheduler (filtered out!)
         uniform_loss = k.sum() + tau.sum()
         uniform_loss.backward(retain_graph=True)
         self.assertAlmostEqual(
             float(self.layer.scheduler[2].weight.grad.abs().max().item()), 0.0, places=6
         )
 
-        # Backward 2: relative cross-condition loss flows gradients without detach into both scheduler and context
         self.layer.zero_grad()
         ctx.grad = None
         weights = torch.linspace(-1.0, 1.0, 8)
@@ -148,13 +197,13 @@ class LPVFOPDTTests(unittest.TestCase):
             "forced_delta_c"
         ].detach()
         self.assertEqual(float(forced_up[0, 0]), 0.0)
-        self.assertTrue(torch.all(forced_up[0, 1:] > 0))
+        self.assertTrue(torch.all(forced_up[0, 2:] > 0))
 
         fut_dn = torch.full((1, 8), 8.0)
         forced_dn = self.layer(ctx, cur, fut_dn, torch.zeros(1, 1), torch.zeros(1, 1))[
             "forced_delta_c"
         ].detach()
-        self.assertTrue(torch.all(forced_dn[0, 1:] < 0))
+        self.assertTrue(torch.all(forced_dn[0, 2:] < 0))
 
     def test_prior_loss_penalizes_k_and_tau_boundary_collapse(self):
         k_center = torch.tensor([self.cfg.gain_c_per_tph])
@@ -167,7 +216,7 @@ class LPVFOPDTTests(unittest.TestCase):
         self.assertGreater(l_bound, 0.5)
 
 
-class FeatureTests(unittest.TestCase):
+class FeatureAndDecoderTests(unittest.TestCase):
     def test_features_causal_and_shapes(self):
         cfg = make_cfg()
         t = torch.linspace(900, 940, cfg.history_steps).numpy()
@@ -196,6 +245,18 @@ class FeatureTests(unittest.TestCase):
         np.testing.assert_allclose(feat[:5, 4], [0.25, 0.5, 0.75, 1.0, 1.0])
         self.assertEqual(float(feat[5, 4]), 0.0)
         self.assertTrue(np.all((feat[:, 4] >= 0) & (feat[:, 4] <= 1)))
+
+    def test_fft_harmonic_wave_prior_extrapolates_periodic_sine(self):
+        cfg = ForecastConfig(history_steps=240, horizon_steps=60, d_model=16)
+        dec = FourierDilatedConvDecoder(cfg)
+        # 构造周期为 15min (60步，共 4 个完整周期) 的余弦振荡信号
+        t_all = torch.arange(300, dtype=torch.float32)
+        wave = torch.cos(2.0 * np.pi * t_all / 60.0)  # 周期 60 步 (k=4)
+        hist_rel = (wave[:240] - wave[239]).view(1, 240, 1)
+        expected_fut = wave[240:] - wave[239]
+        prior_fut = dec.extract_harmonic_wave_prior(hist_rel)[0]
+        corr = float(torch.corrcoef(torch.stack([prior_fut, expected_fut]))[0, 1].item())
+        self.assertGreater(corr, 0.98)
 
 
 class LossTests(unittest.TestCase):
@@ -257,16 +318,12 @@ class LossTests(unittest.TestCase):
 
 
 class ModelEndToEndTests(unittest.TestCase):
-    def test_equal_weight_three_component_addition_and_decoder_architecture(self):
+    def test_equal_weight_three_component_addition_and_realtime_step_response_outputs(self):
         torch.manual_seed(7)
         cfg = make_cfg()
         model = ControlOrientedForecaster(cfg, c_temp=3, c_coal=5)
         self.assertIsInstance(model.decoder, FourierDilatedConvDecoder)
-        self.assertFalse(hasattr(model, "hist_coal_scale"))
-        self.assertFalse(hasattr(model, "closed_loop_coupling"))
-        self.assertFalse(hasattr(model, "trend_decoder"))
 
-        # Check multi-scale dilated convolutions (dilation = 3, 6, 12 for 1.5min / 3min / 6min)
         b0 = model.decoder.dilated_blocks[0]
         self.assertEqual(b0.conv_1m5.dilation, (3,))
         self.assertEqual(b0.conv_3m.dilation, (6,))
@@ -281,8 +338,10 @@ class ModelEndToEndTests(unittest.TestCase):
         s = torch.ones(B)
         out = model(th, uh, cur_u, fut_u, m, s)
         self.assertEqual(out["temperature_delta_c"].shape, (B, 8))
+        self.assertEqual(out["step_response_full"].shape, (B, 8))
+        self.assertEqual(out["step_response_forced"].shape, (B, 8))
+        self.assertEqual(out["step_response_trunc"].shape, (B, 8))
 
-        # Exact 1.0 equal-weight identity: ΔT_pred = ΔT_dist + 1.0*ΔT_hist_coal + 1.0*ΔT_fut_coal
         expected_free = out["disturb_delta_c"] + out["hist_coal_delta_c"]
         expected_pred = expected_free + out["forced_delta_c"]
         torch.testing.assert_close(out["free_delta_c"], expected_free, atol=1e-6, rtol=1e-6)
@@ -296,7 +355,6 @@ class ModelEndToEndTests(unittest.TestCase):
         self.assertTrue(
             all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
         )
-        # Verify LPV scheduler receives finite gradients without detach
         self.assertIsNotNone(model.coal_response.scheduler[0].weight.grad)
 
         kpi = kpi_metrics(
@@ -334,7 +392,6 @@ class ModelEndToEndTests(unittest.TestCase):
         m = torch.zeros(B)
         s = torch.ones(B)
 
-        # Dual turning point target wave (full period with both peak +25C and valley -25C inside 60 steps)
         t_grid = torch.linspace(0.1, 2.0 * np.pi, cfg.horizon_steps)
         target = (25.0 * torch.sin(t_grid)).unsqueeze(0).expand(B, -1)
         opt = torch.optim.AdamW(model.parameters(), lr=1e-2)

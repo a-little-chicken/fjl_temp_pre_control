@@ -1,28 +1,15 @@
 #!/usr/bin/env python3
-"""控制导向预测训练流水线（三分量严格 1.0 等权相加 + LPV 批次零均值正交投影 + 傅里叶多尺度空洞卷积解码器 + 瘦身正交 Loss）。
+"""控制导向分解炉温度轨迹预测：数据加载、评估与两阶段训练流水线（模块化重构版）。
 
 =============================================================================
-训练流水线重构与优化说明
+文件章节导览
 =============================================================================
-1. 【三分量严格等权相加（系数全固定为 1.0）】：
-   - 预测方程严格固定为：
-         ΔT_pred = ΔT_dist + 1.0 * ΔT_hist_coal + 1.0 * ΔT_fut_coal
-   - 彻底移除 `hist_coal_scale` (γ)、`closed_loop_coupling` (c_cl)、`gain_calibration`、
-     `saturation_discount`、历史煤量 `_soft_saturate` 平移以及训练后网格标定逻辑。
-
-2. 【LPV 物理模块“批次零均值正交投影”端到端联合训练】：
-   - Stage 1（物理先验中心锚定预训练）：
-     冻结 `coal_response`（锁定 K_t = 15.0, τ_t = 200.0s），先行剥离 100% 确定性的在途尾煤余热与未来煤量受迫响应，
-     训练双流编码器与连续时间傅里叶-多尺度空洞卷积解码器拟合净外部扰动 `disturb_delta_c`；
-   - Stage 2（批次零均值正交投影 LPV 微调）：
-     放开 `coal_response.scheduler`，不断开梯度（不 detach），通过批次零均值正交投影自动滤除闭环全局负偏置，
-     仅保留跨工况的相对动态自适应调制（K_t ∈ [12, 18] around 15.0，τ_t ∈ [150, 250]s around 200s）。
-
-3. 【双变量高信噪比输入 + 编码器近端煤量脱敏 + 瘦身正交 Loss】：
-   - 移除全部热工协变量，仅保留 `decompose_temp` + `feed_actual` 双变量（`sat_temp` 仅作 >800℃ 开窑筛选）；
-   - 保留方案 B 编码器近端在途窗口高频煤量脱敏，防止黑盒吞噬物理在途余热；
-   - Loss 移除压制波峰振幅的 `d2.square()` 曲率重罚、`res_reg` 与冗余 `sign_loss`，保留远期加权 Huber、
-     红线越界惩罚、多尺度一阶差分斜率匹配、去均值皮尔逊相关与相位对齐振幅匹配、均值零偏约束。
+- Section 1: 5s->15s 严格时间轴校验、开窑工况连续窗口过滤 (`load_data`) 与预计算数据集 (`WindowDataset`)
+- Section 2: 验证集离线评估器 (`evaluate`) —— 同时输出轨迹精度、KPI 与实时 `step_response` 序列统计
+- Section 3: 两阶段端到端训练循环 (`train_one_fold`) 与命令行参数解析 (`main`)
+             * Stage 1: 锁定阶跃响应先验中心 (K=15.0, τ=200s)，预训练双流编码器与周期延续空洞卷积解码器；
+             * Stage 2: 放开状态自适应阶跃响应生成器，通过批次零均值正交投影学习跨工况动态阶跃曲线；
+             * 支持通过 `--forced-shaping {none,hard_trunc,sigmoid_gate,power_soft}` 一键对比受迫响应整形策略。
 
 安全边界：离线只读 CSV，不访问 IOT、不下发动作；
 未来真实煤量仅作为事后 Oracle 条件输入，保持当前煤量仅作历史标签诊断。
@@ -42,10 +29,13 @@ from torch.utils.data import DataLoader, Dataset
 
 from control_forecast import (
     ControlOrientedForecaster,
-    ControlTrajectoryLoss,
     ForecastConfig,
-    kpi_metrics,
     max_in_flight_steps,
+)
+from loss_and_metrics import (
+    ControlTrajectoryLoss,
+    base_metrics,
+    kpi_metrics,
     virtual_step_check,
 )
 
@@ -57,11 +47,11 @@ C_TEMP, C_COAL = 3, 5
 
 
 # ===========================================================================
-# 1. 预计算加速滑动窗口数据集（仅温度 + 尾煤双变量）
+# Section 1: 数据加载、因果清洗与预计算滑动窗口数据集
 # ===========================================================================
 
 class WindowDataset(Dataset):
-    """支持全局因果特征预计算的滑动窗口数据集（仅 decompose_temp + feed_actual）。"""
+    """支持全局因果特征预计算的高速滑动窗口数据集（仅 decompose_temp + feed_actual）。"""
 
     def __init__(
         self,
@@ -89,9 +79,9 @@ class WindowDataset(Dataset):
         self._uf = (self.coal - config.coal_mean_tph) * inv_u_scale
         self._pulse = np.zeros_like(self.coal)
         self._pulse[1:] = np.clip(np.diff(self.coal) * inv_u_scale, -5.0, 5.0)
-        coal_for_prefix = np.nan_to_num(self.coal, nan=0.0, posinf=0.0, neginf=0.0).astype(
-            np.float64
-        )
+        coal_for_prefix = np.nan_to_num(
+            self.coal, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float64)
         self._coal_cs = np.r_[0.0, np.cumsum(coal_for_prefix, dtype=np.float64)]
         self._coal_cs2 = np.r_[0.0, np.cumsum(coal_for_prefix ** 2)]
         self._below = self.coal < config.sat_low_tph
@@ -176,15 +166,14 @@ class WindowDataset(Dataset):
         )
 
 
-# ===========================================================================
-# 2. 数据加载、因果清洗与严格防穿越切分
-# ===========================================================================
-
 def load_data(
     csv_path: str | Path,
     stride: int,
     in_flight_settling_ratio: float = 0.99,
-    decouple_recent_coal: bool = True,
+    decouple_recent_coal: bool = False,
+    forced_shaping_mode: str = "power_soft",
+    forced_trunc_ratio: float = 0.20,
+    forced_power_gamma: float = 2.0,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -194,7 +183,7 @@ def load_data(
     ForecastConfig,
     dict,
 ]:
-    """读取 5s 源 CSV 数据，重采样至 15s，执行开窑工况连续窗口过滤与严格时间轴切分。"""
+    """读取 5s 源 CSV 数据，重采样至 15s，执行开窑工况连续窗口过滤与严格防穿越时间切分。"""
     cols = ["time", "decompose_temp", "feed_actual", "sat_temp"]
     frame = pd.read_csv(csv_path, usecols=cols, low_memory=False)
     source_rows = len(frame)
@@ -224,11 +213,15 @@ def load_data(
     stat_mask = valid & train_time_mask
     if not stat_mask.any():
         stat_mask = valid
+
     cfg = ForecastConfig(
         coal_mean_tph=float(np.nanmean(coal[stat_mask])),
         coal_scale_tph=max(float(np.nanstd(coal[stat_mask])), 1e-3),
         in_flight_settling_ratio=in_flight_settling_ratio,
         decouple_recent_coal=decouple_recent_coal,
+        forced_shaping_mode=forced_shaping_mode,
+        forced_trunc_ratio=forced_trunc_ratio,
+        forced_power_gamma=forced_power_gamma,
     )
 
     bad_prefix = np.r_[0, np.cumsum(~valid)]
@@ -249,57 +242,23 @@ def load_data(
     if len(train) == 0 or len(val) == 0:
         raise ValueError(f"切分为空 train={len(train)} val={len(val)}")
 
-    return (
-        temp,
-        coal,
-        times,
-        train,
-        val,
-        cfg,
-        {
-            "source_rows": source_rows,
-            "rows_15s": len(frame),
-            "valid_fraction": float(valid.mean()),
-            "stride_samples": stride,
-            "train_origins": len(train),
-            "validation_origins": len(val),
-            "train_last_origin": str(times[train[-1]]),
-            "validation_first_origin": str(times[val[0]]),
-            "validation_last_target": str(times[val[-1] + cfg.horizon_steps]),
-        },
-    )
-
-
-# ===========================================================================
-# 3. 评价指标与两阶段端到端训练循环
-# ===========================================================================
-
-def base_metrics(
-    target: np.ndarray, pred: np.ndarray, cur: np.ndarray, weights: np.ndarray
-) -> dict[str, float]:
-    """计算基础点预测误差与宏观方向一致性指标。"""
-    del cur
-    err = pred - target
-    w = weights[None, :]
-    horizon_bias = err.mean(0)
-    sig_end = np.abs(target[:, -1]) > 3.0
-    end_dir_acc = (
-        float((np.sign(pred[sig_end, -1]) == np.sign(target[sig_end, -1])).mean())
-        if sig_end.any()
-        else 1.0
-    )
-    return {
-        "weighted_15min_rmse_c": float(np.sqrt(np.mean(np.sum(w * err ** 2, 1) / w.sum()))),
-        "endpoint_rmse_c": float(np.sqrt((err[:, -1] ** 2).mean())),
-        "endpoint_direction_accuracy": end_dir_acc,
-        "all_point_p90_abs_error_c": float(np.quantile(np.abs(err), 0.9)),
-        "max_abs_horizon_mean_bias_c": float(np.abs(horizon_bias).max()),
-        "step0_mean_bias_c": float(horizon_bias[0]),
-        "step0_rmse_c": float(np.sqrt((err[:, 0] ** 2).mean())),
-        "per_window_mean_mae_c": float(np.abs(err.mean(1)).mean()),
-        "mean_abs_error_c": float(np.abs(err).mean()),
+    split_info = {
+        "source_rows": source_rows,
+        "rows_15s": len(frame),
+        "valid_fraction": float(valid.mean()),
+        "stride_samples": stride,
+        "train_origins": len(train),
+        "validation_origins": len(val),
+        "train_last_origin": str(times[train[-1]]),
+        "validation_first_origin": str(times[val[0]]),
+        "validation_last_target": str(times[val[-1] + cfg.horizon_steps]),
     }
+    return temp, coal, times, train, val, cfg, split_info
 
+
+# ===========================================================================
+# Section 2: 验证集评估器（轨迹指标 + 控制 KPI + 实时 Step Response 统计）
+# ===========================================================================
 
 @torch.no_grad()
 def evaluate(
@@ -310,7 +269,7 @@ def evaluate(
     loss_fn: ControlTrajectoryLoss,
     with_kpi: bool,
 ) -> tuple[dict, dict[str, np.ndarray]]:
-    """在验证集上执行离线 Oracle 评估与保持当前煤量（Hold-Current）诊断。"""
+    """在验证集上执行离线 Oracle 评估、保持当前煤量（Hold-Current）诊断及实时 Step Response 采集。"""
     del loss_fn
     model.eval()
     acc = {
@@ -328,6 +287,8 @@ def evaluate(
             "eff_steps",
             "k_t",
             "tau_t",
+            "step_response_full",
+            "step_response_forced",
         )
     }
     kpis = {}
@@ -351,6 +312,8 @@ def evaluate(
         acc["eff_steps"].append(out["in_flight_eff_steps"].cpu().numpy())
         acc["k_t"].append(out["k_t"].cpu().numpy())
         acc["tau_t"].append(out["tau_t"].cpu().numpy())
+        acc["step_response_full"].append(out["step_response_full"].cpu().numpy())
+        acc["step_response_forced"].append(out["step_response_forced"].cpu().numpy())
 
         if with_kpi and len(kpis) == 0:
             kpis["virtual_step"] = virtual_step_check(
@@ -368,13 +331,19 @@ def evaluate(
     weights /= weights.mean()
 
     truth = arr["truth"]
-    report = base_metrics(truth, arr["free"], arr["current"], weights)
+    cur_mean = float(arr["current"].mean())
+    report = base_metrics(truth, arr["free"], arr["current"], weights, ref_mean_temp_c=cur_mean)
     report["evaluation_mode"] = "oracle_future_actual_coal"
-    report["hold_current_diagnostic"] = base_metrics(truth, arr["hold"], arr["current"], weights)
+    report["forced_shaping_mode"] = cfg.forced_shaping_mode
+    report["hold_current_diagnostic"] = base_metrics(
+        truth, arr["hold"], arr["current"], weights, ref_mean_temp_c=cur_mean
+    )
     report.update(
         {
             "samples": len(truth),
-            "evaluation_temperature_mean_c": float(arr["current"].mean()),
+            "evaluation_temperature_mean_c": cur_mean,
+            "closed_loop_coupling": 1.0,
+            "hist_coal_scale": 1.0,
             "hist_coal_delta_std_c": float(arr["hist_coal"].std()),
             "forced_delta_std_c": float(arr["forced"].std()),
             "disturb_delta_std_c": float(arr["disturb"].std()),
@@ -382,6 +351,8 @@ def evaluate(
             "k_t_std": float(arr["k_t"].std()),
             "tau_t_mean": float(arr["tau_t"].mean()),
             "tau_t_std": float(arr["tau_t"].std()),
+            "step_response_5m_mean_c": float(arr["step_response_full"][:, min(19, cfg.horizon_steps - 1)].mean()),
+            "step_response_5m_std_c": float(arr["step_response_full"][:, min(19, cfg.horizon_steps - 1)].std()),
             "in_flight_eff_steps_mean": float(arr["eff_steps"].mean()),
             "in_flight_eff_steps_std": float(arr["eff_steps"].std()),
         }
@@ -394,15 +365,118 @@ def evaluate(
     return report, arr
 
 
+# ===========================================================================
+# Section 3: 两阶段端到端训练循环与命令行入口
+# ===========================================================================
+
+def _run_training_epochs(
+    stage_name: str,
+    num_epochs: int,
+    model: ControlOrientedForecaster,
+    optimizer: torch.optim.Optimizer,
+    clip_params: list[torch.nn.Parameter],
+    prior_weight: float,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: ForecastConfig,
+    device: torch.device,
+    loss_fn: ControlTrajectoryLoss,
+    out_dir: Path,
+    history: list[dict],
+    min_epochs: int,
+    patience: int,
+    save_ckpt_name: str,
+    save_predictions: bool,
+) -> tuple[dict | None, float]:
+    """统一封装单阶段训练与验证选模循环。"""
+    best_score = float("inf")
+    best_report = None
+    stale = 0
+    started = time.time()
+
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        total_loss, sample_count = 0.0, 0
+        for th, uh, cur_t, cur_u, fut_t, fut_u, m, s, _ in train_loader:
+            th, uh, cur_t, cur_u, fut_t, fut_u, m, s = [
+                x.to(device, non_blocking=True)
+                for x in (th, uh, cur_t, cur_u, fut_t, fut_u, m, s)
+            ]
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(
+                device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"
+            ):
+                outv = model(th, uh, cur_u, fut_u, m, s)
+                truth = fut_t - cur_t[:, None]
+                lp = loss_fn(outv["temperature_delta_c"], truth, cur_t)
+                loss = lp["total"] + prior_weight * outv["prior_loss"]
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
+            optimizer.step()
+            total_loss += float(loss.detach()) * len(th)
+            sample_count += len(th)
+
+        rep, arr = evaluate(model, val_loader, cfg, device, loss_fn, with_kpi=True)
+        kpi_dict = rep.get("kpi") or {}
+        body_r = float(kpi_dict.get("body_p2p_ratio") or 0.0)
+        mean_r = float(kpi_dict.get("mean_pearson_r") or 0.0)
+        dir_acc = float(kpi_dict.get("direction_accuracy_multi_horizon") or 0.0)
+
+        sel_score = (
+            rep["weighted_15min_rmse_c"]
+            + (12.0 * max(0.0, 0.80 - body_r) + 8.0 * max(0.0, body_r - 1.25) if save_predictions else 0.0)
+            + 10.0 * max(0.0, 0.65 - mean_r)
+            + 10.0 * max(0.0, 0.75 - dir_acc)
+        )
+        row = {
+            "epoch": f"{stage_name}-{epoch}",
+            "train_loss": total_loss / max(sample_count, 1),
+            **{k: v for k, v in rep.items() if k not in ("kpi", "virtual_step_check")},
+            "kpi": rep.get("kpi"),
+            "virtual_step_check": rep.get("virtual_step_check"),
+            "selection_score": sel_score,
+            "elapsed_s": time.time() - started,
+        }
+        history.append(row)
+        pd.DataFrame(history).to_csv(out_dir / "history.csv", index=False)
+        print(stage_name, json.dumps(row, ensure_ascii=False), flush=True)
+
+        if sel_score < best_score:
+            best_score = sel_score
+            best_report = rep
+            stale = 0
+            torch.save(
+                {"state_dict": model.state_dict(), "epoch": epoch, "stage": stage_name},
+                out_dir / save_ckpt_name,
+            )
+            if save_predictions:
+                np.savez_compressed(
+                    out_dir / "validation_predictions.npz",
+                    free=arr["free"],
+                    forced=arr["forced"],
+                    hist_coal=arr["hist_coal"],
+                    disturb=arr["disturb"],
+                    hold=arr["hold"],
+                    truth=arr["truth"],
+                    current=arr["current"],
+                    future_coal=arr["future_coal"],
+                    time=arr["time"],
+                    eff_steps=arr["eff_steps"],
+                    k_t=arr["k_t"],
+                    tau_t=arr["tau_t"],
+                    step_response_full=arr["step_response_full"],
+                    step_response_forced=arr["step_response_forced"],
+                )
+        else:
+            stale += 1
+        if epoch >= min_epochs and stale >= patience:
+            break
+
+    return best_report, best_score
+
+
 def train_one_fold(args: argparse.Namespace, cfg: ForecastConfig, device: torch.device) -> dict:
-    """执行两阶段训练：
-    - Stage 1（物理先验中心锁定预训练）：
-      冻结 `coal_response` 于工程先验中心 (K=15.0, τ=200s)，按 1.0 等权相加先行剥离历史在途与未来煤量热效应，
-      训练编码器与傅里叶-空洞卷积解码器拟合净外部扰动 `disturb_delta_c`；
-    - Stage 2（批次零均值正交投影 LPV 联合微调）：
-      以 `0.05 * lr` 放开 `coal_response.scheduler`，不断开梯度，通过批次零均值正交投影滤除全局闭环负偏置，
-      学习跨工况相对动态调制（K_t ∈ [12, 18] around 15.0，τ_t ∈ [150, 250]s around 200s）。
-    """
+    """执行两阶段训练与验证归档。"""
     del cfg
     random.seed(SEED)
     np.random.seed(SEED)
@@ -413,7 +487,10 @@ def train_one_fold(args: argparse.Namespace, cfg: ForecastConfig, device: torch.
         args.csv,
         args.window_stride,
         in_flight_settling_ratio=args.in_flight_settling_ratio,
-        decouple_recent_coal=not args.no_coal_decouple,
+        decouple_recent_coal=args.decouple_recent_coal,
+        forced_shaping_mode=args.forced_shaping,
+        forced_trunc_ratio=args.forced_trunc_ratio,
+        forced_power_gamma=args.forced_power_gamma,
     )
     model = ControlOrientedForecaster(
         cfg, C_TEMP, C_COAL, use_in_flight=not args.no_in_flight
@@ -453,50 +530,32 @@ def train_one_fold(args: argparse.Namespace, cfg: ForecastConfig, device: torch.
         max_step_c=cfg.max_step_delta_c,
     ).to(device)
 
-    out = Path(args.output)
-    out.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
     derived_max_in_flight = max_in_flight_steps(cfg)
     protocol = {
-        "version": "v6_equal_weight_orthogonal_lpv_fourier_tcn",
+        "version": "v6_state_adaptive_step_response_conv",
         "seed": SEED,
         "training_paradigm": (
             "1.0 Equal-Weight 3-Component Decomposition "
-            "+ Batch Zero-Mean Orthogonal Projection LPV "
-            "+ Near-Term Coal Decoupling (Scheme B) "
-            "+ Continuous-Time Fourier Query & Multi-Scale Dilated TCN Decoder"
+            "+ State-Adaptive Step Response Sequence Convolution "
+            f"+ Forced Phase Shaping ({cfg.forced_shaping_mode}) "
+            "+ 60min FFT Harmonic Wave Prior & Multi-Scale Dilated TCN Decoder"
         ),
         "use_in_flight": not args.no_in_flight,
-        "decouple_recent_coal": not args.no_coal_decouple,
+        "decouple_recent_coal": bool(cfg.decouple_recent_coal),
+        "forced_shaping_mode": cfg.forced_shaping_mode,
+        "forced_trunc_ratio": cfg.forced_trunc_ratio,
+        "forced_power_gamma": cfg.forced_power_gamma,
         "decoder_architecture": (
-            "FourierDilatedConvDecoder (Continuous-Time Fourier Query + 1.5m/3m/6m Dilated 1D Conv ResNet + origin_gate)"
+            "FourierDilatedConvDecoder (Continuous-Time Fourier Query + 60min FFT Harmonic Wave Prior + 1.5m/3m/6m Dilated TCN)"
         ),
         "input": (
-            f"past60min 温度相空间(3ch+因果正交相位) + 慢变包络解耦尾煤(5ch) + FOPDT动态窗口在途余热状态机(max={derived_max_in_flight}步)"
+            f"past60min 温度相空间(3ch+因果正交相位) + 尾煤包络(5ch) + 状态自适应60步阶跃响应序列卷积(in_flight={derived_max_in_flight}步)"
         ),
-        "output": "future 15min 温度轨迹（ΔT_dist + 1.0*ΔT_hist_coal + 1.0*ΔT_fut_coal）",
-        "validation_action_contract": (
-            "future actual coal is Oracle-only; hold-current is counterfactual-ready physics-decoupled diagnostic"
+        "output": (
+            "future 15min 温度轨迹（ΔT_dist + 1.0*ΔT_hist_coal + 1.0*ΔT_fut_coal）+ 实时 60 步 step_response_full / step_response_forced"
         ),
-        "fopdt_prior": {
-            "K_base": cfg.gain_c_per_tph,
-            "tau_base_s": cfg.tau_seconds,
-            "dead_steps": cfg.dead_steps,
-            "K_range": [cfg.gain_low, cfg.gain_high],
-            "tau_range_s": [cfg.tau_low, cfg.tau_high],
-            "in_flight_steps_floor": cfg.in_flight_steps,
-            "in_flight_settling_ratio": cfg.in_flight_settling_ratio,
-            "in_flight_max_steps_derived": derived_max_in_flight,
-        },
-        "loss": {
-            "event_weight_sq": args.event_weight,
-            "corr_weight_pearson": args.corr_weight,
-            "trend_weight_multiscale": args.trend_weight,
-            "amp_weight_phase_gated": args.amp_weight,
-            "calm_p2p_gate_c": args.calm_p2p,
-            "mean_bias_weight_dual_dim": args.mean_bias_weight,
-        },
-        "fold": "train target end < 2026-10-01; validation [2026-10-01 01:00, 2026-10-15)",
-        "open_kiln_filter": "temp>800 & sat>800，完整连续窗口（统计量严格仅由训练集估计）",
         "config": cfg.__dict__,
         "channels": {"temp": C_TEMP, "coal": C_COAL},
         "split_info": split_info,
@@ -506,11 +565,14 @@ def train_one_fold(args: argparse.Namespace, cfg: ForecastConfig, device: torch.
         "test_inference": False,
         "IOT_access": False,
     }
-    (out / "protocol.json").write_text(
+    (out_dir / "protocol.json").write_text(
         json.dumps(protocol, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # ---------- Stage 1：锁定物理先验中心 (K=15, τ=200s)，1.0 等权扣除在途与受迫煤量响应，预训练主干与空洞卷积解码器 ----------
+    started = time.time()
+    history: list[dict] = []
+
+    # ---------- Stage 1: 冻结阶跃响应序列生成器于先验中心，预训练编码器与解码器 ----------
     for p in model.parameters():
         p.requires_grad_(True)
     for p in model.coal_response.parameters():
@@ -519,77 +581,33 @@ def train_one_fold(args: argparse.Namespace, cfg: ForecastConfig, device: torch.
     backbone_params = [p for p in model.parameters() if p.requires_grad]
     opt1 = torch.optim.AdamW(backbone_params, lr=args.lr)
 
-    best = float("inf")
-    best_report = None
-    stale = 0
-    started = time.time()
-    history = []
-
-    for epoch in range(1, args.stage1_epochs + 1):
-        model.train()
-        tl, n = 0.0, 0
-        for th, uh, cur_t, cur_u, fut_t, fut_u, m, s, _ in train_loader:
-            th, uh, cur_t, cur_u, fut_t, fut_u = [
-                x.to(device, non_blocking=True)
-                for x in (th, uh, cur_t, cur_u, fut_t, fut_u)
-            ]
-            m = m.to(device, non_blocking=True)
-            s = s.to(device, non_blocking=True)
-            opt1.zero_grad(set_to_none=True)
-            with torch.autocast(
-                device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"
-            ):
-                outv = model(th, uh, cur_u, fut_u, m, s)
-                truth = fut_t - cur_t[:, None]
-                lp = loss_fn(outv["temperature_delta_c"], truth, cur_t)
-                loss = lp["total"] + outv["prior_loss"]
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(backbone_params, 1.0)
-            opt1.step()
-            tl += float(loss.detach()) * len(th)
-            n += len(th)
-
-        rep, _ = evaluate(model, val_loader, cfg, device, loss_fn, with_kpi=True)
-        kpi_s1 = rep.get("kpi") or {}
-        s1_score = (
-            rep["weighted_15min_rmse_c"]
-            + 10.0 * max(0.0, 0.65 - float(kpi_s1.get("mean_pearson_r") or 0.0))
-            + 10.0 * max(0.0, 0.75 - float(kpi_s1.get("direction_accuracy_multi_horizon") or 0.0))
-        )
-        row = {
-            "epoch": f"s1-{epoch}",
-            "train_loss": tl / max(n, 1),
-            **{k: v for k, v in rep.items() if k not in ("kpi", "virtual_step_check")},
-            "kpi": rep.get("kpi"),
-            "selection_score": s1_score,
-            "elapsed_s": time.time() - started,
-        }
-        history.append(row)
-        pd.DataFrame(history).to_csv(out / "history.csv", index=False)
-        print("stage1", json.dumps(row, ensure_ascii=False), flush=True)
-
-        if s1_score < best:
-            best = s1_score
-            best_report = rep
-            stale = 0
-            torch.save(
-                {"state_dict": model.state_dict(), "epoch": epoch, "stage": 1},
-                out / "best_stage1.pt",
-            )
-        else:
-            stale += 1
-        if stale >= 3:
-            break
-
-    if (out / "best_stage1.pt").exists():
-        ckpt1 = torch.load(out / "best_stage1.pt", map_location=device, weights_only=False)
+    s1_report, _ = _run_training_epochs(
+        stage_name="s1",
+        num_epochs=args.stage1_epochs,
+        model=model,
+        optimizer=opt1,
+        clip_params=backbone_params,
+        prior_weight=1.0,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        cfg=cfg,
+        device=device,
+        loss_fn=loss_fn,
+        out_dir=out_dir,
+        history=history,
+        min_epochs=1,
+        patience=3,
+        save_ckpt_name="best_stage1.pt",
+        save_predictions=False,
+    )
+    if (out_dir / "best_stage1.pt").exists():
+        ckpt1 = torch.load(out_dir / "best_stage1.pt", map_location=device, weights_only=False)
         model.load_state_dict(ckpt1["state_dict"])
-
-    (out / "stage1_report.json").write_text(
-        json.dumps(best_report, ensure_ascii=False, indent=2), encoding="utf-8"
+    (out_dir / "stage1_report.json").write_text(
+        json.dumps(s1_report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # ---------- Stage 2：解冻 LPV 调制网络，利用批次零均值正交投影联合微调 ----------
+    # ---------- Stage 2: 放开状态自适应阶跃响应序列生成器，联合微调 ----------
     for p in model.parameters():
         p.requires_grad_(True)
     lpv_param_ids = {id(p) for p in model.coal_response.parameters()}
@@ -602,105 +620,43 @@ def train_one_fold(args: argparse.Namespace, cfg: ForecastConfig, device: torch.
         ]
     )
 
-    best = float("inf")
-    best_report = None
-    stale = 0
-    s2_start = time.time()
+    best_report, best_score = _run_training_epochs(
+        stage_name="s2",
+        num_epochs=args.epochs,
+        model=model,
+        optimizer=opt2,
+        clip_params=list(model.parameters()),
+        prior_weight=5.0,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        cfg=cfg,
+        device=device,
+        loss_fn=loss_fn,
+        out_dir=out_dir,
+        history=history,
+        min_epochs=args.min_epochs,
+        patience=args.patience,
+        save_ckpt_name="best.pt",
+        save_predictions=True,
+    )
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        tl, n = 0.0, 0
-        for th, uh, cur_t, cur_u, fut_t, fut_u, m, s, _ in train_loader:
-            th, uh, cur_t, cur_u, fut_t, fut_u = [
-                x.to(device, non_blocking=True)
-                for x in (th, uh, cur_t, cur_u, fut_t, fut_u)
-            ]
-            m = m.to(device, non_blocking=True)
-            s = s.to(device, non_blocking=True)
-            opt2.zero_grad(set_to_none=True)
-            with torch.autocast(
-                device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"
-            ):
-                outv = model(th, uh, cur_u, fut_u, m, s)
-                truth = fut_t - cur_t[:, None]
-                lp = loss_fn(outv["temperature_delta_c"], truth, cur_t)
-                loss = lp["total"] + 5.0 * outv["prior_loss"]
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt2.step()
-            tl += float(loss.detach()) * len(th)
-            n += len(th)
-
-        rep, arr = evaluate(model, val_loader, cfg, device, loss_fn, with_kpi=True)
-        kpi_dict = rep.get("kpi") or {}
-        body_r = float(kpi_dict.get("body_p2p_ratio") or 0.0)
-        mean_r = float(kpi_dict.get("mean_pearson_r") or 0.0)
-        dir_acc = float(kpi_dict.get("direction_accuracy_multi_horizon") or 0.0)
-
-        sel_score = (
-            rep["weighted_15min_rmse_c"]
-            + 12.0 * max(0.0, 0.80 - body_r)
-            + 8.0 * max(0.0, body_r - 1.25)
-            + 10.0 * max(0.0, 0.65 - mean_r)
-            + 10.0 * max(0.0, 0.75 - dir_acc)
-        )
-        row = {
-            "epoch": f"s2-{epoch}",
-            "train_loss": tl / max(n, 1),
-            **{k: v for k, v in rep.items() if k not in ("kpi", "virtual_step_check")},
-            "kpi": rep.get("kpi"),
-            "virtual_step_check": rep.get("virtual_step_check"),
-            "selection_score": sel_score,
-            "elapsed_s": time.time() - s2_start,
-        }
-        history.append(row)
-        pd.DataFrame(history).to_csv(out / "history.csv", index=False)
-        print("stage2", json.dumps(row, ensure_ascii=False), flush=True)
-
-        if sel_score < best:
-            best = sel_score
-            best_report = rep
-            stale = 0
-            torch.save(
-                {"state_dict": model.state_dict(), "epoch": epoch, "stage": 2},
-                out / "best.pt",
-            )
-            np.savez_compressed(
-                out / "validation_predictions.npz",
-                free=arr["free"],
-                forced=arr["forced"],
-                hist_coal=arr["hist_coal"],
-                disturb=arr["disturb"],
-                hold=arr["hold"],
-                truth=arr["truth"],
-                current=arr["current"],
-                future_coal=arr["future_coal"],
-                time=arr["time"],
-                eff_steps=arr["eff_steps"],
-                k_t=arr["k_t"],
-                tau_t=arr["tau_t"],
-            )
-        else:
-            stale += 1
-        if epoch >= args.min_epochs and stale >= args.patience:
-            break
-
-    (out / "validation_metrics.json").write_text(
+    (out_dir / "validation_metrics.json").write_text(
         json.dumps(best_report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    (out / "status.json").write_text(
+    (out_dir / "status.json").write_text(
         json.dumps(
             {
                 "state": "completed",
-                "version": "v6_equal_weight_orthogonal_lpv_fourier_tcn",
+                "version": "v6_state_adaptive_step_response_conv",
+                "forced_shaping_mode": cfg.forced_shaping_mode,
                 "best_validation_weighted_rmse_c": (
-                    best_report["weighted_15min_rmse_c"] if best_report else best
+                    best_report["weighted_15min_rmse_c"] if best_report else best_score
                 ),
-                "best_selection_score": best,
+                "best_selection_score": best_score,
                 "elapsed_seconds": time.time() - started,
                 "warning": (
                     "开发验证集，非盲测；主要指标为 future_actual_coal Oracle；"
-                    "三分量严格 1.0 等权相加与批次零均值正交投影已启用；没有在线性能或因果辨识结论"
+                    "状态自适应阶跃响应序列卷积与受迫相位整形已启用；严禁在线下发"
                 ),
             },
             ensure_ascii=False,
@@ -713,33 +669,55 @@ def train_one_fold(args: argparse.Namespace, cfg: ForecastConfig, device: torch.
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="控制导向分解炉温度轨迹预测训练脚本（三分量 1.0 等权 + LPV 批次零均值正交投影 + 傅里叶多尺度空洞卷积解码器）"
+        description="控制导向分解炉温度轨迹预测训练脚本（状态自适应阶跃响应序列卷积 + 受迫相位整形 + 周期延续空洞卷积解码）"
     )
     p.add_argument("--csv", required=True, help="5s 原始工业运行数据 CSV 路径")
     p.add_argument("--output", required=True, help="模型权重与评估报告输出目录")
     p.add_argument("--device", default="cuda:1", help="训练设备（如 cuda:0 / cpu）")
     p.add_argument("--window-stride", type=int, default=16, help="训练滑动窗口步长（15s 单位）")
     p.add_argument("--batch-size", type=int, default=384, help="训练与验证批次大小")
-    p.add_argument("--stage1-epochs", type=int, default=5, help="Stage 1 物理先验锁定残差预训练轮数")
-    p.add_argument("--epochs", type=int, default=12, help="Stage 2 LPV 联合微调最大轮数")
+    p.add_argument("--stage1-epochs", type=int, default=5, help="Stage 1 主干预训练轮数")
+    p.add_argument("--epochs", type=int, default=12, help="Stage 2 联合微调最大轮数")
     p.add_argument("--min-epochs", type=int, default=5, help="Stage 2 早停最小轮数")
     p.add_argument("--patience", type=int, default=4, help="Stage 2 早停容忍轮数")
     p.add_argument("--workers", type=int, default=4, help="DataLoader 工作进程数")
     p.add_argument("--lr", type=float, default=3e-4, help="主干网络基准学习率")
     p.add_argument("--event-weight", type=float, default=1.0, help="工艺红线越界惩罚权重")
-    p.add_argument("--amp-weight", type=float, default=0.5, help="相位对齐振幅匹配权重")
+    p.add_argument("--amp-weight", type=float, default=0.5, help="相位对齐振幅与 FFT 能量匹配权重")
     p.add_argument("--calm-p2p", type=float, default=12.0, help="激活振幅损失的真实峰谷差阈值(℃)")
     p.add_argument("--trend-weight", type=float, default=0.45, help="四级多尺度一阶差分斜率匹配权重")
     p.add_argument("--corr-weight", type=float, default=0.85, help="去均值波形皮尔逊相关损失权重")
     p.add_argument("--mean-bias-weight", type=float, default=0.5, help="双维均值零偏锚定权重")
     p.add_argument(
+        "--forced-shaping",
+        default="power_soft",
+        choices=["none", "hard_trunc", "sigmoid_gate", "power_soft"],
+        help="未来受迫响应阶跃序列初期相位整形模式（默认 power_soft）",
+    )
+    p.add_argument(
+        "--forced-trunc-ratio",
+        type=float,
+        default=0.20,
+        help="hard_trunc 或 sigmoid_gate 模式下的初期响应截断比例阈值（默认 0.20）",
+    )
+    p.add_argument(
+        "--forced-power-gamma",
+        type=float,
+        default=2.0,
+        help="power_soft 模式下的完成度幂次指数 γ（默认 2.0，将 20% 初期响应平滑压至 4%）",
+    )
+    p.add_argument(
         "--in-flight-settling-ratio",
         type=float,
         default=0.99,
-        help="FOPDT 在途余热有效窗口收敛比例阈值（默认 0.99，对应 4.605 倍动态时间常数）",
+        help="历史在途余热有效窗口收敛比例阈值（默认 0.99）",
     )
     p.add_argument("--no-in-flight", action="store_true", help="禁用在途余热分解")
-    p.add_argument("--no-coal-decouple", action="store_true", help="禁用方案 B 编码器近端高频煤量解耦屏蔽")
+    p.add_argument(
+        "--decouple-recent-coal",
+        action="store_true",
+        help="是否在编码器侧屏蔽近端尾煤高频通道（默认关闭，保留近端控制器动作指纹）",
+    )
     args = p.parse_args()
     torch.set_num_threads(4)
     if args.device.startswith("cuda") and not torch.cuda.is_available():
