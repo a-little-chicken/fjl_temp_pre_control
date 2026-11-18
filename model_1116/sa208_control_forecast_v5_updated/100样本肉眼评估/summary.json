@@ -1,0 +1,27 @@
+{
+  "population": "3302 V4 development-validation windows; not independent test set",
+  "selection": "exact same 100 non-overlapping validation origins as V3 visual review",
+  "prediction_contract": "future actual coal is Oracle-only; no online claim",
+  "n": 100,
+  "v4_sample_rmse_median_c": 20.272753715515137,
+  "v4_sample_rmse_p10_p90_c": [
+    9.128256130218507,
+    38.09539260864259
+  ],
+  "v4_sample_rmse_min_max_c": [
+    3.736219882965088,
+    72.85677337646484
+  ],
+  "v3_paired_sample_rmse_median_c": 16.87330436706543,
+  "v4_rmse_better_count": 27,
+  "v4_rmse_worse_count": 73,
+  "paired_median_rmse_change_v4_minus_v3_c": 3.2368202209472656,
+  "v4_p2p_ratio_median": 0.5905686020851135,
+  "v4_p2p_ratio_in_0p85_1p15_fraction": 0.14,
+  "artifacts": [
+    "overview_100_paired.png",
+    "100_samples_paired.pdf",
+    "samples_paired.csv",
+    "sample_001.png ... sample_100.png"
+  ]
+}

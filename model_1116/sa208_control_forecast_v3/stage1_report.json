@@ -1,0 +1,28 @@
+{
+  "weighted_15min_rmse_c": 23.371495460928525,
+  "endpoint_rmse_c": 25.724836349487305,
+  "all_point_p90_abs_error_c": 36.21059036254883,
+  "max_abs_horizon_mean_bias_c": 7.712255954742432,
+  "step0_mean_bias_c": 0.6761373281478882,
+  "step0_rmse_c": 5.163235664367676,
+  "per_window_mean_mae_c": 9.065435409545898,
+  "mean_abs_error_c": 15.601581573486328,
+  "evaluation_mode": "oracle_future_actual_coal",
+  "hold_current_diagnostic": {
+    "weighted_15min_rmse_c": 23.371495460928525,
+    "endpoint_rmse_c": 25.724836349487305,
+    "all_point_p90_abs_error_c": 36.21059036254883,
+    "max_abs_horizon_mean_bias_c": 7.712255954742432,
+    "step0_mean_bias_c": 0.6761373281478882,
+    "step0_rmse_c": 5.163235664367676,
+    "per_window_mean_mae_c": 9.065435409545898,
+    "mean_abs_error_c": 15.601581573486328
+  },
+  "samples": 3302,
+  "evaluation_temperature_mean_c": 900.5657348632812,
+  "closed_loop_coupling": 0.0,
+  "stage1_calibration": {
+    "calibrated_gain_scale": 0.3,
+    "closed_loop_coupling": 0.1
+  }
+}

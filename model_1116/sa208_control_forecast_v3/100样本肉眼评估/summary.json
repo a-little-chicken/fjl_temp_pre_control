@@ -1,0 +1,25 @@
+{
+  "population": "3302 V3 development-validation windows, not an independent test set",
+  "selection": "fixed-seed random (20261117), 100 origins; at least 16 min between selected windows",
+  "prediction_contract": "future actual coal is Oracle-only; not online-deployable performance",
+  "n": 100,
+  "sample_rmse_median_c": 16.87330436706543,
+  "sample_rmse_p10_p90_c": [
+    6.836065387725831,
+    35.018671798706066
+  ],
+  "sample_rmse_min_max_c": [
+    3.8274834156036377,
+    60.075008392333984
+  ],
+  "p2p_ratio_median": 0.8141988515853882,
+  "p2p_ratio_in_0p85_1p15_fraction": 0.23,
+  "window_bias_median_c": -2.001152515411377,
+  "window_bias_abs_p90_c": 19.885376167297366,
+  "artifacts": [
+    "overview_100.png",
+    "100_samples.pdf",
+    "samples.csv",
+    "sample_001.png ... sample_100.png"
+  ]
+}

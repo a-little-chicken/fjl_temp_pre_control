@@ -1,0 +1,94 @@
+{
+  "version": "v3",
+  "seed": 20261116,
+  "input": "past60min 温度相空间(3ch+因果正交相位) + 尾煤/包络(5ch)；推理时另有候选未来煤量",
+  "output": "future 15min 温度轨迹（起点热惯性门控 + 增量锚定 T_t + ΔT）",
+  "architecture": "dual-stream PatchTST(shared encoder + causal phase) + context-conditioned query + Cross-Attention + horizon Conv1d mixer + origin inertia gate + LPV-FOPDT",
+  "validation_action_contract": "future actual coal is Oracle-only; hold-current is historical-label diagnostic, not counterfactual",
+  "stage1_interpretation": "Stage 1 pretrains free-response backbone under physical prior center, followed by train-set closed-loop coupling calibration; not causal identification",
+  "fopdt_prior": {
+    "K_base": 15.0,
+    "tau_base_s": 200.0,
+    "dead_steps": 1,
+    "K_range": [
+      7.5,
+      22.5
+    ],
+    "tau_range_s": [
+      120.0,
+      280.0
+    ],
+    "calibration_range": [
+      0.3,
+      3.0
+    ],
+    "note": "工程先验+完整边界软势垒锚定，非因果辨识"
+  },
+  "loss": {
+    "far_weight": "0.5->2.0 quadratic normalized",
+    "peak_thresholds_c": [
+      880,
+      950
+    ],
+    "event_weight_sq": 1.0,
+    "amp_weight_phase_aligned": 0.9,
+    "calm_p2p_gate_c": 12.0,
+    "trend_weight_origin_anchored": 0.15,
+    "smooth_weight_origin_anchored": 0.05,
+    "mean_bias_weight_dual_dim": 0.6
+  },
+  "fold": "train target end < 2026-10-01; validation [2026-10-01 01:00, 2026-10-15)",
+  "open_kiln_filter": "temp>800 & sat>800，完整连续窗口",
+  "config": {
+    "history_steps": 240,
+    "horizon_steps": 60,
+    "patch_len": 8,
+    "patch_stride": 4,
+    "d_model": 64,
+    "n_heads": 4,
+    "n_layers": 2,
+    "dropout": 0.1,
+    "dt_seconds": 15.0,
+    "gain_c_per_tph": 15.0,
+    "tau_seconds": 200.0,
+    "dead_steps": 1,
+    "gain_low": 7.5,
+    "gain_high": 22.5,
+    "tau_low": 120.0,
+    "tau_high": 280.0,
+    "calibration_low": 0.3,
+    "calibration_high": 3.0,
+    "temperature_scale_c": 50.0,
+    "coal_mean_tph": 10.522988319396973,
+    "coal_scale_tph": 5.29521369934082,
+    "coal_mean_window": 120,
+    "coal_std_window": 20,
+    "sat_low_tph": 5.0,
+    "sat_low_max_steps": 12,
+    "coal_ema_beta": 0.5,
+    "coal_linear_step_tph": 2.5,
+    "coal_max_extra_tph": 2.0,
+    "origin_ramp_steps": 1.5,
+    "max_step_delta_c": 6.0
+  },
+  "channels": {
+    "temp": 3,
+    "coal": 5
+  },
+  "split_info": {
+    "source_rows": 6289921,
+    "rows_15s": 2096641,
+    "valid_fraction": 0.8104315426436858,
+    "stride_samples": 16,
+    "train_origins": 95826,
+    "validation_origins": 3302,
+    "train_last_origin": "2026-09-30 23:43:45",
+    "validation_first_origin": "2026-10-01 01:03:45",
+    "validation_last_target": "2026-10-14 23:58:45"
+  },
+  "batch_size": 384,
+  "max_epochs": 12,
+  "stage1_epochs": 4,
+  "test_inference": false,
+  "IOT_access": false
+}

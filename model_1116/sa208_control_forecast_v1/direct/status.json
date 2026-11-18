@@ -1,0 +1,8 @@
+{
+  "state": "completed",
+  "arm": "direct",
+  "best_validation_weighted_rmse_c": 24.206894987894206,
+  "epochs_run": 15,
+  "elapsed_seconds": 88.17951560020447,
+  "warning": "development validation, not blind test; residual arm uses future-actual-coal Oracle diagnostics"
+}

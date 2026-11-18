@@ -1,0 +1,52 @@
+{
+  "weighted_15min_rmse_c": 23.964559980844697,
+  "endpoint_rmse_c": 26.223466873168945,
+  "all_point_p90_abs_error_c": 37.632686614990234,
+  "max_abs_horizon_mean_bias_c": 6.938600063323975,
+  "step0_mean_bias_c": -1.162952184677124,
+  "step0_rmse_c": 3.6613082885742188,
+  "per_window_mean_mae_c": 9.263670921325684,
+  "mean_abs_error_c": 16.187246322631836,
+  "evaluation_mode": "oracle_future_actual_coal",
+  "hold_current_diagnostic": {
+    "weighted_15min_rmse_c": 23.421606097477255,
+    "endpoint_rmse_c": 25.669464111328125,
+    "all_point_p90_abs_error_c": 36.78059768676758,
+    "max_abs_horizon_mean_bias_c": 6.945302486419678,
+    "step0_mean_bias_c": -1.162952184677124,
+    "step0_rmse_c": 3.6613082885742188,
+    "per_window_mean_mae_c": 8.952043533325195,
+    "mean_abs_error_c": 15.799138069152832
+  },
+  "samples": 3302,
+  "evaluation_temperature_mean_c": 900.5657348632812,
+  "closed_loop_coupling": 0.10000000149011612,
+  "hist_coal_scale": 0.17788882553577423,
+  "hist_coal_delta_std_c": 15.751859664916992,
+  "kpi": {
+    "peak_valley_mae_c": 14.153809547424316,
+    "redline_mae_c": 24.008594512939453,
+    "redline_points": 42663,
+    "turn_time_mae_steps": 3.2128664495114005,
+    "turn_within_2steps_fraction": 0.4700325732899023,
+    "true_window_turns": 13079,
+    "pred_window_turns": 14988,
+    "turn_miss_fraction": 0.5305451487116752,
+    "p2p_ratio": 0.8017525672912598,
+    "mean_truth_p2p_c": 56.73297119140625,
+    "mean_pred_p2p_c": 45.48580551147461,
+    "body_p2p_ratio": 0.7960913181304932
+  },
+  "virtual_step_check": {
+    "step_up_endpoint_mean_c": 22.322031021118164,
+    "step_down_endpoint_mean_c": -22.32202911376953,
+    "sign_correct": true,
+    "monotone_fraction_up": 1.0,
+    "monotone_fraction_down": 1.0,
+    "k_t_mean": 11.397143363952637,
+    "k_t_std": 0.6096518039703369,
+    "tau_t_mean": 228.35110473632812,
+    "tau_t_std": 5.704354286193848,
+    "hist_coal_endpoint_std_c": 20.100692749023438
+  }
+}

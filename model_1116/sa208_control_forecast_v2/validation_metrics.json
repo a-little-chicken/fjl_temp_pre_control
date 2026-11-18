@@ -1,0 +1,38 @@
+{
+  "weighted_15min_rmse_c": 32.93362921478416,
+  "endpoint_rmse_c": 39.40690231323242,
+  "all_point_p90_abs_error_c": 50.68903350830078,
+  "max_abs_horizon_mean_bias_c": 24.33451271057129,
+  "mean_abs_error_c": 21.410524368286133,
+  "evaluation_mode": "oracle_future_actual_coal",
+  "hold_current_diagnostic": {
+    "weighted_15min_rmse_c": 29.828957628593564,
+    "endpoint_rmse_c": 34.02323532104492,
+    "all_point_p90_abs_error_c": 46.039283752441406,
+    "max_abs_horizon_mean_bias_c": 24.33451271057129,
+    "mean_abs_error_c": 19.27995491027832
+  },
+  "samples": 3302,
+  "evaluation_temperature_mean_c": 900.5657348632812,
+  "kpi": {
+    "peak_valley_mae_c": 15.213218688964844,
+    "redline_mae_c": 31.97385597229004,
+    "redline_points": 42663,
+    "turn_time_mae_steps": 4.025413711583925,
+    "true_window_turns": 13536,
+    "pred_window_turns": 20352,
+    "turn_miss_fraction": 0.0,
+    "p2p_ratio": 0.8888871669769287,
+    "mean_truth_p2p_c": 56.73297119140625,
+    "mean_pred_p2p_c": 50.4292106628418
+  },
+  "virtual_step_check": {
+    "step_up_endpoint_mean_c": 14.36407470703125,
+    "step_down_endpoint_mean_c": -14.36407470703125,
+    "sign_correct": true,
+    "monotone_fraction_up": 1.0,
+    "monotone_fraction_down": 1.0,
+    "k_t_mean": 7.5,
+    "tau_t_mean": 279.99884033203125
+  }
+}

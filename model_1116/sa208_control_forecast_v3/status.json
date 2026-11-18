@@ -1,0 +1,8 @@
+{
+  "state": "completed",
+  "version": "v3",
+  "best_validation_weighted_rmse_c": 23.761421055251063,
+  "best_selection_score": 24.83313933079809,
+  "elapsed_seconds": 328.30775690078735,
+  "warning": "开发验证集，非盲测；主要指标为 future_actual_coal Oracle；hold-current 仅为历史标签诊断，非反事实；没有在线性能或因果辨识结论"
+}

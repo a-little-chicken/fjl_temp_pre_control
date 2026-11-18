@@ -1,0 +1,24 @@
+{
+  "weighted_15min_rmse_c": 48.68900699986026,
+  "endpoint_rmse_c": 56.07914733886719,
+  "all_point_p90_abs_error_c": 72.76022338867188,
+  "max_abs_horizon_mean_bias_c": 8.408952713012695,
+  "mean_abs_error_c": 30.576017379760742,
+  "mean_truth_p2p_c": 56.73297119140625,
+  "mean_prediction_p2p_c": 60.5408935546875,
+  "samples": 3302,
+  "evaluation_temperature_mean_c": 900.5657348632812,
+  "selection_loss": 80.43199115329318,
+  "oracle_actual_future_coal_response": true,
+  "hold_current_candidate_metrics": {
+    "weighted_15min_rmse_c": 39.739673828325394,
+    "endpoint_rmse_c": 45.505088806152344,
+    "all_point_p90_abs_error_c": 62.3007698059082,
+    "max_abs_horizon_mean_bias_c": 8.561147689819336,
+    "mean_abs_error_c": 24.526498794555664,
+    "mean_truth_p2p_c": 56.73297119140625,
+    "mean_prediction_p2p_c": 55.101280212402344,
+    "samples": 3302,
+    "evaluation_temperature_mean_c": 900.5657348632812
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "state": "completed",
+  "version": "v4_covar",
+  "best_validation_weighted_rmse_c": 24.144866238886458,
+  "best_selection_score": 24.144866238886458,
+  "elapsed_seconds": 526.4259009361267,
+  "warning": "开发验证集，非盲测；主要指标为 future_actual_coal Oracle；hold-current 仅为历史标签诊断，非反事实；没有在线性能或因果辨识结论"
+}
